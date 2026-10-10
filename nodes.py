@@ -352,16 +352,17 @@ class ViggleAnimateConditioningWindowed:
 
     Splits the driving clip into overlapping 17j+5 windows (default 124 frames —
     the finetune's evaluated chunk length) and emits one conditioning entry per
-    window: the window's OWN footage as the video reference, plus the still,
-    broadcast unchanged to every chunk. Viggle Chunked Sampler carries prior
-    output into each overlap and decodes the assembled latent once.
+    window: the window's OWN footage as the video reference, plus a still.
+    One still is shared by every chunk; a batch gives each chunk its own still
+    (see `chunk_still_indices`). Viggle Chunked Sampler carries prior output
+    into each overlap and decodes the assembled latent once.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
             "cond_video": ("IMAGE", {"tooltip": "The whole driving clip at 24 fps. All loaded frames are used as reference. Generation ends on the next H3 frame-grid boundary, up to 16 frames longer (minimum 5)."}),
-            "ref_image": ("IMAGE", {"tooltip": "Reference still shared by all chunks. A repainted frame from the driving shot with matching pose and framing gives the strongest reference."}),
+            "ref_image": ("IMAGE", {"tooltip": "Reference still: one image shared by all chunks, or a batch with one still per chunk (a repainted frame of that chunk works best). A repainted frame from the driving shot with matching pose and framing gives the strongest reference."}),
             "text_cond": ("TEXT_COND", {"tooltip": "From the Load Text Conditioning node."}),
             "vae": ("VAE", {"tooltip": "MiniMax-H3 video VAE (from the base model)."}),
             "width": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 32,
@@ -375,6 +376,7 @@ class ViggleAnimateConditioningWindowed:
         }, "optional": {
             "continuation": (["five_frame_anchor", "latent_overlap"], {"default": "five_frame_anchor",
                               "tooltip": "Five decoded/re-encoded frames anchor each new window. latent_overlap restores the previous raw-latent carry for comparison."}),
+            "ref_frames": ("STRING", {"default": "", "tooltip": "With a batch of stills: the loaded-clip frame each still was repainted from, comma-separated in batch order (e.g. 30, 140, 250). Each chunk takes the still inside its frame range (the one nearest its centre if several), else the nearest still. Empty: chunk i takes still i (the last still for later chunks)."}),
         }}
 
     RETURN_TYPES = ("VIGGLE_COND_SET", "CONDITIONING")
@@ -385,7 +387,7 @@ class ViggleAnimateConditioningWindowed:
                    "for the Viggle Chunked Sampler. Carries overlap to improve continuity across long clips.")
 
     def build(self, cond_video, ref_image, text_cond, vae, width, height,
-              chunk_frames, overlap_frames, continuation="five_frame_anchor"):
+              chunk_frames, overlap_frames, continuation="five_frame_anchor", ref_frames=""):
         # ---- frozen text conditioning -------------------------------------
         prompt_embeds = text_cond["prompt_embeds"]      # [1, 362, 5120] bf16
         text_token_tags = text_cond["text_token_tags"]  # [362] int64
@@ -410,17 +412,22 @@ class ViggleAnimateConditioningWindowed:
 
         spans = plan_spans(total_f, chunk_frames, ANCHOR_FRAMES if continuation == "five_frame_anchor" else overlap_frames)
 
-        # ---- the still is encoded ONCE for all chunks ----------------------
+        # ---- each distinct still is encoded once --------------------------
         ih, iw = ref_image.shape[1], ref_image.shape[2]
         scale = short_edge / min(iw, ih)  # upscaling included, no area cap (per the finetune)
         th = max(CANVAS_MULTIPLE, round(ih * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
         tw = max(CANVAS_MULTIPLE, round(iw * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
-        ikey = _fingerprint(ref_image[:1], ("i", tw, th, id(vae)))
-        z_img = _cache_get(ikey, vae)
-        if z_img is None:
-            img = ref_image[:1] if (ih, iw) == (th, tw) else core_h3._resize(ref_image[:1], tw, th, "disabled")
-            z_img = vae.encode(img)
-            _cache_put(ikey, vae, z_img)
+        still_of_chunk = chunk_still_indices(spans, ref_image.shape[0], ref_frames)
+        z_imgs = {}
+        for k in sorted(set(still_of_chunk)):
+            still = ref_image[k:k + 1]
+            ikey = _fingerprint(still, ("i", tw, th, id(vae)))
+            z_img = _cache_get(ikey, vae)
+            if z_img is None:
+                img = still if (ih, iw) == (th, tw) else core_h3._resize(still, tw, th, "disabled")
+                z_img = vae.encode(img)
+                _cache_put(ikey, vae, z_img)
+            z_imgs[k] = z_img
 
         # ---- one cond entry per chunk, each with its own footage window ----
         reuse_overlap = (type(vae) is comfy.sd.VAE
@@ -462,10 +469,10 @@ class ViggleAnimateConditioningWindowed:
                            "latent_h": rh // 16, "latent_w": rw // 16,
                            "ref_audio_t": 0, "latent": z_video, "audio_latent": None}
             image_block = {"kind": "image", "latent_h": th // 16, "latent_w": tw // 16,
-                           "latent": z_img.clone()}
+                           "latent": z_imgs[still_of_chunk[i]].clone()}
             conds.append([[prompt_embeds, {"minimax_refs": [video_block, image_block],
                                            "minimax_token_tags": text_token_tags}]])
-            prompts.append(f"chunk {i + 1}: frames {a}-{a + n - 1}")
+            prompts.append(f"chunk {i + 1}: frames {a}-{a + n - 1}, still {still_of_chunk[i] + 1}")
         logging.info("[ViggleAnimateConditioningWindowed] %d chunks over %d frames (%.2fs), "
                      "rerender_chunk is 1-based: %s; reused %d complete VAE blocks",
                      len(conds), total_f, total_f / FPS,
@@ -475,6 +482,38 @@ class ViggleAnimateConditioningWindowed:
         # has a source — the sampler overwrites it per chunk from the cond_set.
         return ({"conds": conds, "prompts": prompts, "spans": spans,
                  "total_frames": total_f, "source_frames": asked_f, "continuation": continuation, "canvas": (ch, cw)}, conds[0])
+
+
+def chunk_still_indices(spans, n_stills, ref_frames=""):
+    """Index of the still each chunk uses.
+
+    One still: every chunk uses it. With `ref_frames` (the clip frame each still
+    was repainted from, in batch order), a chunk takes the still inside its
+    frame range, nearest its centre if several, else the nearest still.
+    Without it, chunk i takes still i, and later chunks the last still.
+    """
+    if n_stills < 1:
+        raise ValueError("Viggle-Animate: ref_image needs at least one still.")
+    if n_stills == 1:
+        return [0] * len(spans)
+    text = (ref_frames or "").strip()
+    if not text:
+        return [min(i, n_stills - 1) for i in range(len(spans))]
+    try:
+        frames = [int(x) for x in text.replace(";", ",").split(",") if x.strip()]
+    except ValueError:
+        raise ValueError(f"Viggle-Animate: ref_frames must be comma-separated frame numbers, got {ref_frames!r}.")
+    if len(frames) != n_stills:
+        raise ValueError(f"Viggle-Animate: ref_frames lists {len(frames)} frames for {n_stills} stills.")
+    picks = []
+    for a, b, _lat0, _latn in spans:
+        centre = (a + b) / 2
+        inside = [k for k, f in enumerate(frames) if a <= f <= b]
+        if inside:
+            picks.append(min(inside, key=lambda k: abs(frames[k] - centre)))
+        else:
+            picks.append(min(range(n_stills), key=lambda k: min(abs(frames[k] - a), abs(frames[k] - b))))
+    return picks
 
 
 def _encode_anchor(vae, video, offset):

@@ -186,6 +186,10 @@ Connect **Viggle-Animate Conditioning (H3, Windowed)** to **Viggle Chunked Sampl
 
 Windowed conditioning reuses complete 17-frame encoder blocks from the preceding window when using the standard ComfyUI H3 VAE. Each window's padded tail is still encoded separately. This reduces repeated VAE work without reducing resolution, changing precision or enlarging the encoding window; custom VAE wrappers retain the full-window path. The log reports how many blocks were reused. Higher resolution and longer clips still cost more to encode.
 
+### One still per chunk (this fork)
+
+**Viggle-Animate Conditioning (H3, Windowed)** also accepts a batch of stills on `ref_image`, so each chunk can use a repainted frame from its own part of the clip, for example one after the subject turns around. Set `ref_frames` to the loaded-clip frame each still was repainted from (24 fps numbering, comma-separated, in batch order): each chunk takes the still inside its frame range, the one nearest its centre if several, otherwise the nearest still. With `ref_frames` empty, chunk *i* takes still *i* and later chunks take the last still. A single still behaves exactly as before. Build the batch with core **Batch Images** from same-size stills.
+
 ### Chunk seed controls
 
 | Control | Meaning |

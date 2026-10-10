@@ -369,6 +369,43 @@ class ChainingTests(unittest.TestCase):
                 self.assertEqual(plan['continuation'], 'five_frame_anchor')
                 self.assertEqual(plan['spans'], viggle.plan_spans(total, 124, 5))
 
+    def test_chunk_still_indices(self):
+        spans = viggle.plan_spans(298, 124, 5)  # three windows over a 12.4 s clip
+        self.assertEqual(len(spans), 3)
+        self.assertEqual(viggle.chunk_still_indices(spans, 1), [0, 0, 0])
+        self.assertEqual(viggle.chunk_still_indices(spans, 2), [0, 1, 1])
+        self.assertEqual(viggle.chunk_still_indices(spans, 3, ""), [0, 1, 2])
+        # each chunk takes the still repainted inside its own frame range (windows: 0-123, 119-242, 187-310)
+        self.assertEqual(viggle.chunk_still_indices(spans, 3, "260, 5, 150"), [1, 2, 0])
+        # a still inside two overlapping windows goes to both unless one has a still nearer its centre
+        self.assertEqual(viggle.chunk_still_indices(spans, 2, "60, 200"), [0, 1, 1])
+        # several stills inside one chunk: the one nearest its centre; a chunk with none: the nearest still
+        a, b = spans[0][0], spans[0][1]
+        self.assertEqual(viggle.chunk_still_indices(spans, 2, f"{a}, {(a + b) // 2}"), [1, 1, 1])
+        with self.assertRaises(ValueError):
+            viggle.chunk_still_indices(spans, 3, "10, 20")
+        with self.assertRaises(ValueError):
+            viggle.chunk_still_indices(spans, 2, "10, x")
+
+    def test_windowed_conditioning_gives_each_chunk_its_own_still(self):
+        class ValueEncoder:
+            # latent filled with the input's first value, so each still is recognisable after encoding
+            def encode(self, frames):
+                return torch.full((1, 24, viggle._frames_to_latents(len(frames)), 2, 2), float(frames[0, 0, 0, 0]))
+
+        viggle._LATENT_CACHE.clear()
+        text = {"prompt_embeds": conditioning()[0][0], "text_token_tags": torch.zeros(3, dtype=torch.int64)}
+        video = torch.zeros(298, 32, 32, 3)
+        stills = torch.stack([torch.full((32, 32, 3), v) for v in (0.25, 0.5, 0.75)])
+        plan = viggle.ViggleAnimateConditioningWindowed().build(
+            video, stills, text, ValueEncoder(), 0, 0, 124, 22, "five_frame_anchor", "20, 140, 260")[0]
+        values = [cond[0][1]["minimax_refs"][1]["latent"].flatten()[0].item() for cond in plan["conds"]]
+        self.assertEqual(values, [0.25, 0.5, 0.75])
+        self.assertTrue(all(p.endswith(f"still {i + 1}") for i, p in enumerate(plan["prompts"])))
+        # one still keeps the original behaviour: the same latent for every chunk
+        plan = viggle.ViggleAnimateConditioningWindowed().build(video, stills[1:2], text, ValueEncoder(), 0, 0, 124, 22)[0]
+        self.assertEqual({cond[0][1]["minimax_refs"][1]["latent"].flatten()[0].item() for cond in plan["conds"]}, {0.5})
+
     def test_single_shot_length_is_a_maximum_without_repeated_reference_frames(self):
         class RecordingEncoder:
             def __init__(self):
